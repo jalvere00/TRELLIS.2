@@ -143,44 +143,43 @@ def slugify(text: str, max_len: int = 40) -> str:
     return slug[:max_len]
 
 
-def generate_image(args, device):
-    """Run text-to-image with FLUX (or compatible diffusers pipeline)."""
-    import torch
-    from diffusers import FluxPipeline
+def generate_image(args):
+    """
+    Run FLUX text-to-image in a subprocess so its CUDA context is fully
+    isolated from TRELLIS.2's sparse-conv / flash-attn initialisation.
+    Returns a PIL Image loaded from the saved temp file.
+    """
+    import subprocess
+    import tempfile
+    from PIL import Image
 
-    print(f"Loading text-to-image model: {args.t2i_model}")
-    t2i = FluxPipeline.from_pretrained(
+    # Write to a temp file; caller may copy it to args.save_image afterward
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp.close()
+    tmp_path = tmp.name
+
+    helper = Path(__file__).parent / "_flux_generate.py"
+    cmd = [
+        sys.executable, str(helper),
+        tmp_path,
         args.t2i_model,
-        torch_dtype=torch.bfloat16,
-    )
-    t2i = t2i.to(device)
+        args.prompt,
+        str(args.t2i_steps),
+        str(args.t2i_guidance),
+        str(args.t2i_width),
+        str(args.t2i_height),
+        str(args.seed),
+    ]
 
-    # TRELLIS works best on clean single-object images; append a helpful suffix
-    full_prompt = (
-        f"{args.prompt}, single object, clean white background, "
-        "product photography, studio lighting, no shadow"
-    )
-    print(f"Prompt: {full_prompt}")
+    print(f"Generating image via {args.t2i_model} (subprocess)...")
+    result = subprocess.run(cmd, env=os.environ.copy())
+    if result.returncode != 0:
+        print("ERROR: image generation subprocess failed.", file=sys.stderr)
+        sys.exit(1)
 
-    import torch
-    generator = torch.Generator(device=device).manual_seed(args.seed)
-    result = t2i(
-        prompt=full_prompt,
-        num_inference_steps=args.t2i_steps,
-        guidance_scale=args.t2i_guidance,
-        width=args.t2i_width,
-        height=args.t2i_height,
-        generator=generator,
-    )
-    image = result.images[0]
-
-    # Free VRAM before loading TRELLIS.2
-    del t2i
-    import gc
-    gc.collect()
-    torch.cuda.empty_cache()
-    print(f"  Text-to-image done. VRAM freed.")
-
+    image = Image.open(tmp_path).copy()
+    os.unlink(tmp_path)
+    print("  Image generation done.")
     return image
 
 
@@ -190,22 +189,19 @@ def main():
     os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-    import cv2
-    import imageio
     import torch
     from PIL import Image
-    from trellis2.pipelines import Trellis2ImageTo3DPipeline
-    from trellis2.renderers import EnvMap
-    from trellis2.utils import render_utils
-    import o_voxel
 
     device = "cuda"
     print(f"VRAM available: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
     # --- Resolve input image ---
+    # IMPORTANT: trellis2 / o_voxel imports are deferred until AFTER image
+    # generation so their CUDA sparse-conv initialisation doesn't corrupt the
+    # CUDA context that FLUX's accelerate hooks expect.
     if args.prompt:
         output_stem = args.output if args.output else slugify(args.prompt)
-        image = generate_image(args, device)
+        image = generate_image(args)
         if args.save_image:
             image.save(args.save_image)
             print(f"  Generated image saved to {args.save_image}")
@@ -216,6 +212,14 @@ def main():
             sys.exit(1)
         output_stem = args.output if args.output else image_path.stem
         image = Image.open(image_path)
+
+    # Trellis2 imports happen here — after FLUX is done and VRAM is freed
+    import cv2
+    import imageio
+    from trellis2.pipelines import Trellis2ImageTo3DPipeline
+    from trellis2.renderers import EnvMap
+    from trellis2.utils import render_utils
+    import o_voxel
 
     output_mp4 = Path(f"{output_stem}.mp4")
     output_glb = Path(f"{output_stem}.glb")

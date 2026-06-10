@@ -492,7 +492,16 @@ class SparseUnetVaeDecoder(nn.Module):
                         h, sub = block(h)
                         subs.append(sub)
                     else:
-                        h = block(h, subdiv=guide_subs[i] if guide_subs is not None else None)
+                        # Pull guide sub to the model device on demand,
+                        # then release immediately to minimise peak VRAM.
+                        subdiv = guide_subs[i] if guide_subs is not None else None
+                        if subdiv is not None and subdiv.device != h.device:
+                            subdiv = subdiv.to(h.device)
+                        h = block(h, subdiv=subdiv)
+                        if guide_subs is not None:
+                            guide_subs[i] = None
+                            del subdiv
+                            torch.cuda.empty_cache()
                 else:
                     h = block(h)
         h = h.type(x.dtype)

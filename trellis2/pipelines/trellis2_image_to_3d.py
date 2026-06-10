@@ -446,6 +446,11 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             SparseTensor: The decoded texture voxels
         """
         if self.low_vram:
+            # Move subs to CPU to free VRAM, then load decoder — the decoder
+            # forward pass will pull each sub back to GPU one at a time and
+            # release it immediately after use (see sparse_unet_vae.py).
+            subs = [s.cpu() for s in subs]
+            torch.cuda.empty_cache()
             self.models['tex_slat_decoder'].to(self.device)
         ret = self.models['tex_slat_decoder'](slat, guide_subs=subs) * 0.5 + 0.5
         if self.low_vram:
@@ -468,6 +473,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             resolution (int): The resolution of the output.
         """
         meshes, subs = self.decode_shape_slat(shape_slat, resolution)
+        del shape_slat
+        torch.cuda.empty_cache()
         tex_voxels = self.decode_tex_slat(tex_slat, subs)
         out_mesh = []
         for m, v in zip(meshes, tex_voxels):
