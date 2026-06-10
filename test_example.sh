@@ -31,10 +31,10 @@ pipeline = Trellis2ImageTo3DPipeline.from_pretrained("pretrained/TRELLIS.2-4B")
 pipeline.cuda()
 print(f"VRAM after load: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
-# 3. Run at 512^3 (lowest resolution / lowest VRAM)
-print("Running inference at 512^3...")
+# 3. Run at 1024^3 via cascade (starts at 512, refines to 1024)
+print("Running inference at 1024_cascade...")
 image = Image.open("assets/example_image/T.png")
-mesh = pipeline.run(image, pipeline_type='512')[0]
+mesh = pipeline.run(image, pipeline_type='1024_cascade')[0]
 mesh.simplify(16777216)
 print(f"Inference done! VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
@@ -55,7 +55,7 @@ glb = o_voxel.postprocess.to_glb(
     voxel_size        = mesh.voxel_size,
     aabb              = [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
     decimation_target = 1000000,
-    texture_size      = 1024,
+    texture_size      = 2048,
     remesh            = True,
     remesh_band       = 1,
     remesh_project    = 0,
