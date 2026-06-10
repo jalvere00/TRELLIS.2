@@ -7,32 +7,91 @@ from pathlib import Path
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="TRELLIS.2 image-to-3D inference",
+        description="TRELLIS.2 image-to-3D inference. "
+                    "Accepts either an image file or a text prompt (which generates an image first).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
+
+    # --- Input (mutually exclusive) ---
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
         "image",
-        help="Path to input image (JPEG, PNG, WEBP, etc.)",
+        nargs="?",
+        help="Path to input image (JPEG, PNG, WEBP, etc.).",
     )
+    input_group.add_argument(
+        "--prompt",
+        help="Text description of the object to generate (runs text-to-image first, then 3D).",
+    )
+
+    # --- Output ---
     parser.add_argument(
         "-o", "--output",
         default=None,
         help="Output file prefix (e.g. 'my_model' → my_model.mp4 + my_model.glb). "
-             "Defaults to the input filename stem.",
+             "Defaults to input filename stem or a slug of the prompt.",
     )
+
+    # --- 3D pipeline ---
     parser.add_argument(
         "-p", "--pipeline",
         default="1024_cascade",
         choices=["512", "1024", "1024_cascade", "1536_cascade"],
-        help="Pipeline resolution mode. '512' is fastest/lowest VRAM; "
+        help="Resolution mode. '512' is fastest/lowest VRAM; "
              "'1024_cascade' is the recommended default; "
-             "'1536_cascade' requires most memory.",
+             "'1536_cascade' requires the most memory.",
     )
     parser.add_argument(
         "--weights",
         default="pretrained/TRELLIS.2-4B",
-        help="Path to pretrained weights directory.",
+        help="Path to pretrained TRELLIS.2 weights directory.",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed (applied to both image generation and 3D inference).",
+    )
+
+    # --- Text-to-image options (only used with --prompt) ---
+    t2i = parser.add_argument_group("text-to-image options (--prompt only)")
+    t2i.add_argument(
+        "--t2i-model",
+        default="black-forest-labs/FLUX.1-schnell",
+        help="HuggingFace model ID for text-to-image generation.",
+    )
+    t2i.add_argument(
+        "--t2i-steps",
+        type=int,
+        default=4,
+        help="Number of diffusion steps for image generation.",
+    )
+    t2i.add_argument(
+        "--t2i-guidance",
+        type=float,
+        default=0.0,
+        help="Guidance scale (0.0 = distilled/schnell mode; use 3.5 for FLUX.1-dev).",
+    )
+    t2i.add_argument(
+        "--t2i-width",
+        type=int,
+        default=1024,
+        help="Generated image width in pixels.",
+    )
+    t2i.add_argument(
+        "--t2i-height",
+        type=int,
+        default=1024,
+        help="Generated image height in pixels.",
+    )
+    t2i.add_argument(
+        "--save-image",
+        default=None,
+        help="Save the generated image to this path (e.g. 'generated.png'). "
+             "Useful for inspecting what was sent to TRELLIS.2.",
+    )
+
+    # --- GLB / video export ---
     parser.add_argument(
         "--envmap",
         default="assets/hdri/forest.exr",
@@ -52,12 +111,6 @@ def parse_args():
         help="Target face count after mesh decimation for GLB export.",
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="Random seed for reproducible results.",
-    )
-    parser.add_argument(
         "--fps",
         type=int,
         default=15,
@@ -73,7 +126,62 @@ def parse_args():
         action="store_true",
         help="Skip exporting the GLB file.",
     )
-    return parser.parse_args()
+
+    args = parser.parse_args()
+
+    # positional 'image' inside a mutually-exclusive group needs a manual check
+    if args.image is None and args.prompt is None:
+        parser.error("Provide either an image path or --prompt.")
+
+    return args
+
+
+def slugify(text: str, max_len: int = 40) -> str:
+    import re
+    slug = re.sub(r"[^\w\s-]", "", text.lower())
+    slug = re.sub(r"[\s_-]+", "_", slug).strip("_")
+    return slug[:max_len]
+
+
+def generate_image(args, device):
+    """Run text-to-image with FLUX (or compatible diffusers pipeline)."""
+    import torch
+    from diffusers import FluxPipeline
+
+    print(f"Loading text-to-image model: {args.t2i_model}")
+    t2i = FluxPipeline.from_pretrained(
+        args.t2i_model,
+        torch_dtype=torch.bfloat16,
+    )
+    t2i = t2i.to(device)
+
+    # TRELLIS works best on clean single-object images; append a helpful suffix
+    full_prompt = (
+        f"{args.prompt}, single object, clean white background, "
+        "product photography, studio lighting, no shadow"
+    )
+    print(f"Prompt: {full_prompt}")
+
+    import torch
+    generator = torch.Generator(device=device).manual_seed(args.seed)
+    result = t2i(
+        prompt=full_prompt,
+        num_inference_steps=args.t2i_steps,
+        guidance_scale=args.t2i_guidance,
+        width=args.t2i_width,
+        height=args.t2i_height,
+        generator=generator,
+    )
+    image = result.images[0]
+
+    # Free VRAM before loading TRELLIS.2
+    del t2i
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    print(f"  Text-to-image done. VRAM freed.")
+
+    return image
 
 
 def main():
@@ -91,23 +199,33 @@ def main():
     from trellis2.utils import render_utils
     import o_voxel
 
-    image_path = Path(args.image)
-    if not image_path.exists():
-        print(f"ERROR: image not found: {image_path}", file=sys.stderr)
-        sys.exit(1)
+    device = "cuda"
+    print(f"VRAM available: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-    output_stem = args.output if args.output else image_path.stem
+    # --- Resolve input image ---
+    if args.prompt:
+        output_stem = args.output if args.output else slugify(args.prompt)
+        image = generate_image(args, device)
+        if args.save_image:
+            image.save(args.save_image)
+            print(f"  Generated image saved to {args.save_image}")
+    else:
+        image_path = Path(args.image)
+        if not image_path.exists():
+            print(f"ERROR: image not found: {image_path}", file=sys.stderr)
+            sys.exit(1)
+        output_stem = args.output if args.output else image_path.stem
+        image = Image.open(image_path)
+
     output_mp4 = Path(f"{output_stem}.mp4")
     output_glb = Path(f"{output_stem}.glb")
 
-    print(f"Image:    {image_path}")
-    print(f"Pipeline: {args.pipeline}")
+    print(f"\nPipeline: {args.pipeline}")
     print(f"Output:   {output_stem}.{{mp4,glb}}")
     print(f"Seed:     {args.seed}")
-    print()
+    print(f"Image:    {image.size[0]}x{image.size[1]} {image.mode}\n")
 
-    print(f"VRAM available: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-
+    # --- Load envmap before TRELLIS (small, stays on GPU throughout) ---
     if not args.no_video:
         envmap_path = Path(args.envmap)
         if not envmap_path.exists():
@@ -116,18 +234,15 @@ def main():
         raw = cv2.imread(str(envmap_path), cv2.IMREAD_UNCHANGED)
         envmap = EnvMap(torch.tensor(
             cv2.cvtColor(raw, cv2.COLOR_BGR2RGB),
-            dtype=torch.float32, device="cuda",
+            dtype=torch.float32, device=device,
         ))
 
-    print("Loading pipeline...")
+    # --- TRELLIS.2 ---
+    print("Loading TRELLIS.2...")
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained(args.weights)
     pipeline.cuda()
 
-    print("Loading image...")
-    image = Image.open(image_path)
-    print(f"  Size: {image.size}, mode: {image.mode}")
-
-    print(f"Running inference ({args.pipeline})...")
+    print(f"Running 3D inference ({args.pipeline})...")
     mesh = pipeline.run(image, pipeline_type=args.pipeline, seed=args.seed)[0]
     mesh.simplify(16_777_216)
     print(f"  Done — VRAM: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
